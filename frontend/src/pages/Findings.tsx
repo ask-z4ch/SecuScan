@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { getFindings } from '../api'
-import { formatLocaleDate } from '../utils/date'
+import { formatLocaleDate, parseDateSafe } from '../utils/date'
 
 type Finding = {
   id: string
@@ -84,11 +84,18 @@ function filterPillClasses(isActive: boolean) {
     : 'border-silver-bright/10 bg-charcoal-dark text-silver/65 hover:border-silver-bright/30 hover:text-silver-bright'
 }
 
+type SortMode = 'severity' | 'newest' | 'oldest' | 'target'
+
 export default function Findings() {
   const [findings, setFindings] = useState<Finding[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [filterSeverity, setFilterSeverity] = useState('all')
+  const [filterTarget, setFilterTarget] = useState('all')
+  const [filterCategory, setFilterCategory] = useState('all')
+  const [sortMode, setSortMode] = useState<SortMode>('severity')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null)
   const [reviewState, setReviewState] = useState<ReviewState>({})
   const [copiedFindingId, setCopiedFindingId] = useState<string | null>(null)
@@ -129,11 +136,43 @@ export default function Findings() {
     [findings, reviewState],
   )
 
+  // Collect unique targets and categories so we can build filter dropdowns.
+  const uniqueTargets = useMemo(() => {
+    const seen = new Set<string>()
+    for (const f of enrichedFindings) {
+      if (f.target) seen.add(f.target)
+    }
+    return Array.from(seen).sort()
+  }, [enrichedFindings])
+
+  const uniqueCategories = useMemo(() => {
+    const seen = new Set<string>()
+    for (const f of enrichedFindings) {
+      if (f.category) seen.add(f.category)
+    }
+    return Array.from(seen).sort()
+  }, [enrichedFindings])
+
   const filteredFindings = useMemo(() => {
     const query = searchQuery.trim().toLowerCase()
 
+    // Parse date boundaries once so we don't redo it per finding
+    const fromMs = dateFrom ? new Date(dateFrom).getTime() : null
+    const toMs = dateTo ? new Date(dateTo + 'T23:59:59').getTime() : null
+
     return enrichedFindings.filter((finding) => {
       const matchesSeverity = filterSeverity === 'all' || finding.severity === filterSeverity
+      const matchesTarget = filterTarget === 'all' || finding.target === filterTarget
+      const matchesCategory = filterCategory === 'all' || finding.category === filterCategory
+
+      // Date range check
+      if (fromMs || toMs) {
+        const ts = parseDateSafe(finding.discovered_at)?.getTime()
+        if (!ts) return false
+        if (fromMs && ts < fromMs) return false
+        if (toMs && ts > toMs) return false
+      }
+
       const haystack = [
         finding.title,
         finding.target,
@@ -146,17 +185,43 @@ export default function Findings() {
         .join(' ')
         .toLowerCase()
 
-      return matchesSeverity && haystack.includes(query)
+      return matchesSeverity && matchesTarget && matchesCategory && haystack.includes(query)
     })
-  }, [enrichedFindings, filterSeverity, searchQuery])
+  }, [enrichedFindings, filterSeverity, filterTarget, filterCategory, searchQuery, dateFrom, dateTo])
+
+  const sortedFindings = useMemo(() => {
+    const items = [...filteredFindings]
+    switch (sortMode) {
+      case 'newest':
+        return items.sort((a, b) => {
+          const da = parseDateSafe(a.discovered_at)?.getTime() ?? 0
+          const db = parseDateSafe(b.discovered_at)?.getTime() ?? 0
+          return db - da
+        })
+      case 'oldest':
+        return items.sort((a, b) => {
+          const da = parseDateSafe(a.discovered_at)?.getTime() ?? 0
+          const db = parseDateSafe(b.discovered_at)?.getTime() ?? 0
+          return da - db
+        })
+      case 'target':
+        return items.sort((a, b) =>
+          (a.target || '').localeCompare(b.target || '')
+        )
+      case 'severity':
+      default:
+        // Keep the original severity-group ordering; groupedFindings handles it.
+        return items
+    }
+  }, [filteredFindings, sortMode])
 
   const groupedFindings = useMemo(
     () =>
       severityOrder.map((severity) => ({
         severity,
-        items: filteredFindings.filter((finding) => finding.severity === severity),
+        items: sortedFindings.filter((finding) => finding.severity === severity),
       })),
-    [filteredFindings],
+    [sortedFindings],
   )
 
   const selectedFinding =
@@ -219,6 +284,70 @@ export default function Findings() {
     }
   }
 
+  function renderFindingRow(finding: Finding & { severity: string; status: FindingStatus }) {
+    const isSelected = selectedFinding?.id === finding.id
+    const cfg = severityConfig[finding.severity]
+
+    return (
+      <button
+        key={finding.id}
+        type="button"
+        onClick={() => setSelectedFindingId(finding.id)}
+        className={`relative block w-full px-5 py-5 text-left transition-all ${
+          isSelected ? 'bg-silver-bright/6' : 'hover:bg-silver-bright/3'
+        }`}
+      >
+        <span className={`absolute inset-y-0 left-0 w-1 ${cfg.rail}`} />
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0 flex-1 space-y-3 pl-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`px-2 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${cfg.chip}`}>
+                {cfg.label}
+              </span>
+              <span className={`border px-2 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${getStatusTone(finding.status)}`}>
+                {finding.status}
+              </span>
+              <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-silver/35">
+                {finding.category || 'Uncategorized'}
+              </span>
+              {finding.cve ? (
+                <span className="border border-rag-blue/20 bg-rag-blue/10 px-2 py-1 text-[9px] font-mono uppercase tracking-[0.15em] text-rag-blue">
+                  {finding.cve}
+                </span>
+              ) : null}
+            </div>
+
+            <div>
+              <h3 className="text-xl font-black uppercase tracking-tight text-silver-bright">{finding.title}</h3>
+              <p className="mt-2 text-[11px] font-mono uppercase tracking-[0.16em] text-silver/45">
+                Target // {finding.target || 'Unknown'} // Observed // {formatLocaleDate(finding.discovered_at)}
+              </p>
+            </div>
+
+            <p className="max-w-4xl text-sm leading-relaxed text-silver/70">
+              {finding.description || 'No description provided.'}
+            </p>
+          </div>
+
+          <div className="flex flex-row items-end gap-6 lg:min-w-[140px] lg:flex-col lg:items-end">
+            {typeof finding.cvss === 'number' ? (
+              <div className="text-right">
+                <p className="text-[9px] font-black uppercase tracking-[0.2em] text-silver/35">CVSS</p>
+                <p className={`text-3xl font-black italic ${finding.cvss >= 9 ? 'text-rag-red' : 'text-silver-bright'}`}>
+                  {finding.cvss.toFixed(1)}
+                </p>
+              </div>
+            ) : null}
+
+            <span className={`material-symbols-outlined text-lg ${isSelected ? 'text-silver-bright' : 'text-silver/30'}`}>
+              east
+            </span>
+          </div>
+        </div>
+      </button>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-charcoal-dark text-silver px-4 py-6 md:px-8 md:py-10">
       <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-8">
@@ -256,7 +385,7 @@ export default function Findings() {
         </header>
 
         <section className="sticky top-4 z-20 border-2 border-black bg-charcoal/95 p-4 shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] backdrop-blur">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-col gap-4">
             <div className="grid flex-1 gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1.8fr)]">
               <div className="space-y-2">
                 <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">Search</label>
@@ -293,21 +422,88 @@ export default function Findings() {
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-2">
-              {severityOrder.map((severity) => (
-                <button
-                  key={severity}
-                  type="button"
-                  onClick={() => setFilterSeverity((current) => (current === severity ? 'all' : severity))}
-                  className={`border px-3 py-2 text-[10px] font-black uppercase tracking-[0.18em] transition-all ${
-                    filterSeverity === severity
-                      ? `${severityConfig[severity].chip} border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]`
-                      : 'border-silver-bright/10 bg-charcoal-dark text-silver/65 hover:border-silver-bright/30'
-                  }`}
-                >
-                  {severityConfig[severity].label} {countsBySeverity[severity] || 0}
-                </button>
-              ))}
+            {/* Second row: target, category, sort + severity quick-toggles */}
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">Target</label>
+                  <select
+                    value={filterTarget}
+                    onChange={(e) => setFilterTarget(e.target.value)}
+                    className="w-full border-2 border-silver-bright/10 bg-charcoal-dark px-3 py-2.5 text-xs font-mono text-silver-bright focus:border-rag-red focus:outline-none"
+                  >
+                    <option value="all">All Targets</option>
+                    {uniqueTargets.map((t) => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">Category</label>
+                  <select
+                    value={filterCategory}
+                    onChange={(e) => setFilterCategory(e.target.value)}
+                    className="w-full border-2 border-silver-bright/10 bg-charcoal-dark px-3 py-2.5 text-xs font-mono text-silver-bright focus:border-rag-red focus:outline-none"
+                  >
+                    <option value="all">All Categories</option>
+                    {uniqueCategories.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">Sort By</label>
+                  <select
+                    value={sortMode}
+                    onChange={(e) => setSortMode(e.target.value as SortMode)}
+                    className="w-full border-2 border-silver-bright/10 bg-charcoal-dark px-3 py-2.5 text-xs font-mono text-silver-bright focus:border-rag-red focus:outline-none"
+                  >
+                    <option value="severity">Severity (High → Low)</option>
+                    <option value="newest">Newest First</option>
+                    <option value="oldest">Oldest First</option>
+                    <option value="target">Target (A → Z)</option>
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">From Date</label>
+                  <input
+                    type="date"
+                    value={dateFrom}
+                    onChange={(e) => setDateFrom(e.target.value)}
+                    className="w-full border-2 border-silver-bright/10 bg-charcoal-dark px-3 py-2 text-xs font-mono text-silver-bright focus:border-rag-red focus:outline-none"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-[0.2em] text-silver-bright">To Date</label>
+                  <input
+                    type="date"
+                    value={dateTo}
+                    onChange={(e) => setDateTo(e.target.value)}
+                    className="w-full border-2 border-silver-bright/10 bg-charcoal-dark px-3 py-2 text-xs font-mono text-silver-bright focus:border-rag-red focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                {severityOrder.map((severity) => (
+                  <button
+                    key={severity}
+                    type="button"
+                    onClick={() => setFilterSeverity((current) => (current === severity ? 'all' : severity))}
+                    className={`border px-3 py-2 text-[10px] font-black uppercase tracking-[0.18em] transition-all ${
+                      filterSeverity === severity
+                        ? `${severityConfig[severity].chip} border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]`
+                        : 'border-silver-bright/10 bg-charcoal-dark text-silver/65 hover:border-silver-bright/30'
+                    }`}
+                  >
+                    {severityConfig[severity].label} {countsBySeverity[severity] || 0}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </section>
@@ -323,7 +519,7 @@ export default function Findings() {
                 <p className="text-2xl font-black uppercase tracking-[0.25em] text-silver/25 italic">No Findings Match</p>
                 <p className="mt-3 text-xs font-mono uppercase tracking-[0.2em] text-silver/15">Adjust filters to reopen the queue.</p>
               </div>
-            ) : (
+            ) : sortMode === 'severity' ? (
               groupedFindings.map(({ severity, items }) => {
                 if (items.length === 0) return null
 
@@ -342,73 +538,28 @@ export default function Findings() {
                     </div>
 
                     <div className="divide-y divide-silver-bright/6">
-                      {items.map((finding) => {
-                        const isSelected = selectedFinding?.id === finding.id
-                        const config = severityConfig[finding.severity]
-
-                        return (
-                          <button
-                            key={finding.id}
-                            type="button"
-                            onClick={() => setSelectedFindingId(finding.id)}
-                            className={`relative block w-full px-5 py-5 text-left transition-all ${
-                              isSelected ? 'bg-silver-bright/6' : 'hover:bg-silver-bright/3'
-                            }`}
-                          >
-                            <span className={`absolute inset-y-0 left-0 w-1 ${config.rail}`} />
-                            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                              <div className="min-w-0 flex-1 space-y-3 pl-3">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className={`px-2 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${config.chip}`}>
-                                    {config.label}
-                                  </span>
-                                  <span className={`border px-2 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${getStatusTone(finding.status)}`}>
-                                    {finding.status}
-                                  </span>
-                                  <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-silver/35">
-                                    {finding.category || 'Uncategorized'}
-                                  </span>
-                                  {finding.cve ? (
-                                    <span className="border border-rag-blue/20 bg-rag-blue/10 px-2 py-1 text-[9px] font-mono uppercase tracking-[0.15em] text-rag-blue">
-                                      {finding.cve}
-                                    </span>
-                                  ) : null}
-                                </div>
-
-                                <div>
-                                  <h3 className="text-xl font-black uppercase tracking-tight text-silver-bright">{finding.title}</h3>
-                                  <p className="mt-2 text-[11px] font-mono uppercase tracking-[0.16em] text-silver/45">
-                                    Target // {finding.target || 'Unknown'} // Observed // {formatLocaleDate(finding.discovered_at)}
-                                  </p>
-                                </div>
-
-                                <p className="max-w-4xl text-sm leading-relaxed text-silver/70">
-                                  {finding.description || 'No description provided.'}
-                                </p>
-                              </div>
-
-                              <div className="flex flex-row items-end gap-6 lg:min-w-[140px] lg:flex-col lg:items-end">
-                                {typeof finding.cvss === 'number' ? (
-                                  <div className="text-right">
-                                    <p className="text-[9px] font-black uppercase tracking-[0.2em] text-silver/35">CVSS</p>
-                                    <p className={`text-3xl font-black italic ${finding.cvss >= 9 ? 'text-rag-red' : 'text-silver-bright'}`}>
-                                      {finding.cvss.toFixed(1)}
-                                    </p>
-                                  </div>
-                                ) : null}
-
-                                <span className={`material-symbols-outlined text-lg ${isSelected ? 'text-silver-bright' : 'text-silver/30'}`}>
-                                  east
-                                </span>
-                              </div>
-                            </div>
-                          </button>
-                        )
-                      })}
+                      {items.map((finding) => renderFindingRow(finding))}
                     </div>
                   </div>
                 )
               })
+            ) : (
+              <div className="border-2 border-black bg-charcoal shadow-[8px_8px_0px_0px_rgba(0,0,0,1)]">
+                <div className="flex w-full items-center justify-between border-b border-silver-bright/8 px-5 py-4 text-left">
+                  <div className="flex items-center gap-4">
+                    <span className="h-3 w-3 rotate-45 bg-silver-bright" />
+                    <div>
+                      <p className="text-lg font-black uppercase tracking-[0.18em] text-silver-bright">
+                        {sortMode === 'newest' ? 'Newest First' : sortMode === 'oldest' ? 'Oldest First' : 'By Target'}
+                      </p>
+                      <p className="text-[10px] font-mono uppercase tracking-[0.2em] text-silver/40">{sortedFindings.length} visible in queue</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="divide-y divide-silver-bright/6">
+                  {sortedFindings.map((finding) => renderFindingRow(finding))}
+                </div>
+              </div>
             )}
           </motion.section>
 
