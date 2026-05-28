@@ -270,3 +270,33 @@ python scripts/validate_plugin.py --plugin plugins/nmap
 
 The validation checks metadata JSON, required fields, checksums, and custom
 parser imports when applicable.
+
+## Per-Plugin Sandbox Overrides
+
+Each plugin's `metadata.json` may include an optional `sandbox` key that
+overrides the global process sandbox defaults for that specific scanner.
+
+```json
+{
+  "id": "example_plugin",
+  ...
+  "sandbox": {
+    "timeout_seconds": 300,
+    "max_memory_mb": 1024,
+    "max_output_bytes": 10485760,
+    "allow_network": true
+  }
+}
+```
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `timeout_seconds` | integer | `120` | Max wall-clock seconds before SIGTERM → 3s grace → SIGKILL. |
+| `max_memory_mb` | integer | `512` | Virtual memory cap in MB; enforced via `RLIMIT_AS` on Linux. |
+| `max_output_bytes` | integer | `5242880` | Max bytes captured from the subprocess stdout/stderr. |
+| `allow_network` | boolean | `true` | Whether the subprocess may make network connections (reserved for future use). |
+
+Only the fields that differ from the global default need to be specified —
+missing fields inherit the global value. Plugins that require longer execution
+windows (e.g. comprehensive nmap scans, sqlmap aggressions) can raise
+`timeout_seconds` to prevent premature termination.

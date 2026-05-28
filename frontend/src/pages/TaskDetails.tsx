@@ -100,6 +100,15 @@ function formatToolLabel(tool?: string, pluginId?: string) {
     return normalized.toUpperCase()
 }
 
+function formatStatusLabel(status: string): string {
+    switch (status) {
+        case 'terminated:timeout': return 'TERMINATED (TIMEOUT)'
+        case 'terminated:memory_limit': return 'TERMINATED (MEMORY LIMIT)'
+        case 'terminated:output_limit': return 'TERMINATED (OUTPUT LIMIT)'
+        default: return status.toUpperCase()
+    }
+}
+
 const containerVariants = {
     hidden: { opacity: 0 },
     visible: {
@@ -270,7 +279,7 @@ export default function TaskDetails() {
             try {
                 const data = JSON.parse(e.data)
                 setTask((prev: Task | null) => prev ? { ...prev, status: data.status } : null)
-                if (['completed', 'failed', 'cancelled'].includes(data.status)) {
+                if (['completed', 'failed', 'cancelled', 'terminated:timeout', 'terminated:memory_limit', 'terminated:output_limit'].includes(data.status)) {
                     es.close()
                     loadTask()
                 }
@@ -396,11 +405,11 @@ export default function TaskDetails() {
     const completedTime = task.completed_at
         ? formatLocaleTime(task.completed_at, { hour: '2-digit', minute: '2-digit' })
         : '--:--'
-    const isTerminal = ['completed', 'failed', 'cancelled'].includes(task.status)
+    const isTerminal = ['completed', 'failed', 'cancelled', 'terminated:timeout', 'terminated:memory_limit', 'terminated:output_limit'].includes(task.status)
     const durationLabel = isTerminal
         ? (task.duration_seconds
             ? `${Math.floor(task.duration_seconds / 60)}M ${Math.floor(task.duration_seconds % 60)}S`
-            : (task.status === 'completed' ? '0M 0S' : 'TERMINATED'))
+            : (task.status === 'completed' ? '0M 0S' : task.status.startsWith('terminated:') ? formatStatusLabel(task.status) : 'TERMINATED'))
         : 'ACTIVE'
     const severityCounts = findings.reduce((acc: Record<string, number>, finding: any) => {
         const key = (finding.severity || 'info').toLowerCase()
@@ -448,7 +457,9 @@ export default function TaskDetails() {
             ? 'bg-rag-red/15 text-rag-red border-rag-red/30'
             : task.status === 'cancelled'
                 ? 'bg-silver/10 text-silver/70 border-silver/15'
-                : 'bg-rag-amber/15 text-rag-amber border-rag-amber/30'
+                : task.status.startsWith('terminated:')
+                    ? 'bg-rag-amber/15 text-rag-amber border-rag-amber/30'
+                    : 'bg-rag-amber/15 text-rag-amber border-rag-amber/30'
 
     const severityTone = (severity?: string) => {
         const normalized = (severity || '').toLowerCase()
@@ -483,7 +494,7 @@ export default function TaskDetails() {
         ['Target', task.target],
         ['Tool', toolLabel],
         ['Plugin', task.plugin_id || 'N/A'],
-        ['Status', task.status],
+                                ['Status', formatStatusLabel(task.status)],
         ['Start Time', task.started_at ? formatDateLong(task.started_at) : 'PENDING'],
         ['Finish Time', task.completed_at ? formatDateLong(task.completed_at) : 'ACTIVE'],
         ['Duration', durationLabel],
@@ -547,7 +558,7 @@ export default function TaskDetails() {
         : [
             `${String(result?.structured?.total_count || findings.length)} security findings indexed for ${task.target}.`,
             `Risk analysis identifies ${severityCounts[dominantSeverity] || 0} ${dominantSeverity.toUpperCase()} priority items.`,
-            `Current assessment status: ${task.status.toUpperCase()}.`,
+            `Current assessment status: ${formatStatusLabel(task.status)}.`,
             `Scanning engines performed comprehensive inspection via ${toolLabel}.`,
         ]
     const previewFindings = findings.slice(0, 5)
@@ -613,8 +624,11 @@ export default function TaskDetails() {
 
                                     Copy ID
                                 </button>
-                                <span className={`px-3 py-1 text-[10px] uppercase tracking-[0.3em] border ${statusTone}`}>
-                                    {task.status}
+                                <span
+                                    className={`px-3 py-1 text-[10px] uppercase tracking-[0.3em] border ${statusTone}`}
+                                    title={task.error_message && task.status.startsWith('terminated:') ? task.error_message : ''}
+                                >
+                                    {formatStatusLabel(task.status)}
                                 </span>
                             </div>
                             <h1 className="text-4xl md:text-6xl text-silver-bright uppercase tracking-tight leading-none italic font-black">
@@ -629,7 +643,7 @@ export default function TaskDetails() {
                     </div>
 
                     <div className="flex flex-wrap gap-3 xl:justify-end">
-                        {(task.status === 'completed' || task.status === 'failed') && (
+                        {(task.status === 'completed' || task.status === 'failed' || task.status.startsWith('terminated:')) && (
                             <button
                                 onClick={handleRescan}
                                 className="bg-rag-blue px-5 py-3 text-black text-[10px] font-black uppercase tracking-[0.26em] italic transition-colors hover:brightness-110 flex items-center gap-2"
@@ -685,7 +699,7 @@ export default function TaskDetails() {
                 <DetailCard
                     label="SCAN_DURATION"
                     value={durationLabel}
-                    subValue={task.completed_at ? `FINISH::${completedTime}` : (task.status === 'failed' ? 'ERROR_TERMINATED' : task.status === 'cancelled' ? 'USER_CANCELLED' : 'IN_PROGRESS')}
+                    subValue={task.completed_at ? `FINISH::${completedTime}` : (task.status === 'failed' ? 'ERROR_TERMINATED' : task.status === 'cancelled' ? 'USER_CANCELLED' : task.status.startsWith('terminated:') ? formatStatusLabel(task.status) : 'IN_PROGRESS')}
                 />
                 <DetailCard
                     label="TOTAL_FINDINGS"
@@ -695,21 +709,29 @@ export default function TaskDetails() {
             </section>
 
             <AnimatePresence>
-                {task.status === 'failed' && task.error_message && (
+                {(task.status === 'failed' || task.status.startsWith('terminated:')) && task.error_message && (
                     <motion.div
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
-                        className="bg-rag-red/10 border-l-4 border-rag-red p-6 space-y-3"
+                        className={task.status.startsWith('terminated:')
+                            ? 'bg-rag-amber/10 border-l-4 border-rag-amber p-6 space-y-3'
+                            : 'bg-rag-red/10 border-l-4 border-rag-red p-6 space-y-3'}
                     >
-                        <div className="flex items-center gap-3 text-rag-red">
+                        <div className={task.status.startsWith('terminated:') ? 'flex items-center gap-3 text-rag-amber' : 'flex items-center gap-3 text-rag-red'}>
                             <DetailIcon icon={AlertCircleIcon} />
-                            <h3 className="text-xs font-black uppercase tracking-[0.3em] italic">Critical_Execution_Fault</h3>
+                            <h3 className="text-xs font-black uppercase tracking-[0.3em] italic">
+                                {task.status.startsWith('terminated:') ? 'Sandbox_Violation' : 'Critical_Execution_Fault'}
+                            </h3>
                         </div>
                         <p className="text-sm font-mono text-silver/80 leading-relaxed max-w-4xl">
                             {task.error_message}
                         </p>
                         <div className="pt-2">
-                            <span className="text-[9px] font-black text-silver/30 uppercase tracking-[0.2em] italic">Diagnostic_Code::EXEC_FAIL_{task.exit_code || 'ERR'}</span>
+                            <span className="text-[9px] font-black text-silver/30 uppercase tracking-[0.2em] italic">
+                                {task.status.startsWith('terminated:')
+                                    ? `Diagnostic_Code::SANDBOX_${formatStatusLabel(task.status)}`
+                                    : `Diagnostic_Code::EXEC_FAIL_${task.exit_code || 'ERR'}`}
+                            </span>
                         </div>
                     </motion.div>
                 )}
@@ -1094,7 +1116,7 @@ export default function TaskDetails() {
                             {[
                                 ['Tool', toolLabel],
                                 ['Plugin', task.plugin_id || 'N/A'],
-                                ['Status', task.status],
+        ['Status', formatStatusLabel(task.status)],
                                 ['Created', formatDateLong(task.created_at)],
                                 ['Started', task.started_at ? formatDateLong(task.started_at) : 'PENDING'],
                                 ['Completed', task.completed_at ? formatDateLong(task.completed_at) : 'ACTIVE'],

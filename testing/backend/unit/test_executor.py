@@ -194,6 +194,7 @@ async def test_execute_task_sets_cancelled_status_in_db(setup_test_environment):
         mock_plugin.name = "nmap"
         mock_plugin.presets = {}
         mock_plugin.docker_image = None
+        mock_plugin.sandbox = None
         mock_pm.return_value.get_plugin.return_value = mock_plugin
         mock_pm.return_value.build_command.return_value = ["nmap", "127.0.0.1"]
 
@@ -237,7 +238,7 @@ async def test_execute_task_releases_limiter_on_normal_completion(setup_test_env
     executor = TaskExecutor()
 
     async def fake_command(*args, **kwargs):
-        return "80/tcp open http", 0
+        return "80/tcp open http", 0, None
 
     with patch.object(executor, "_execute_command", side_effect=fake_command), \
          patch("backend.secuscan.executor.concurrent_limiter") as mock_limiter, \
@@ -252,6 +253,7 @@ async def test_execute_task_releases_limiter_on_normal_completion(setup_test_env
         mock_plugin.output = {"parser": "builtin_nmap", "format": "text"}
         mock_plugin.category = "Network"
         mock_plugin.id = "nmap"
+        mock_plugin.sandbox = None
         mock_pm.return_value.get_plugin.return_value = mock_plugin
         mock_pm.return_value.build_command.return_value = ["nmap", "127.0.0.1"]
         mock_pm.return_value.plugins_dir = MagicMock()

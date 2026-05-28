@@ -76,11 +76,17 @@ class Settings(BaseSettings):
 
     trusted_proxies: List[str] = ["127.0.0.1", "::1"]
 
-    # Sandbox
+    # Sandbox — Docker isolation
     docker_enabled: bool = False
-    sandbox_timeout: int = 600  # seconds
+    sandbox_timeout: int = 600  # seconds (legacy, used by _resolve_execution_timeout)
     sandbox_cpu_quota: float = 0.5
     sandbox_memory_mb: int = 512
+
+    # Sandbox — subprocess resource limits
+    sandbox_timeout_seconds: int = 120
+    sandbox_max_memory_mb: int = 512
+    sandbox_max_output_bytes: int = 5_242_880
+    sandbox_allow_network: bool = True
 
     # Task-start payload limits (tunable via env vars)
     task_start_max_body_bytes: int = 64_000       # 64 KB total JSON body
