@@ -509,7 +509,7 @@ class TaskExecutor:
     ) -> tuple:
         config = SandboxConfig(
             timeout_seconds=timeout,
-            max_memory_mb=settings.sandbox_max_memory_mb,
+            max_memory_mb=settings.sandbox_memory_mb,
             max_output_bytes=settings.sandbox_max_output_bytes,
             allow_network=settings.sandbox_allow_network,
         )

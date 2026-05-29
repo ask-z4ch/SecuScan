@@ -81,6 +81,8 @@ class Settings(BaseSettings):
     sandbox_timeout: int = 600  # seconds
     sandbox_cpu_quota: float = 0.5
     sandbox_memory_mb: int = 512
+    sandbox_max_output_bytes: int = 5_242_880  # 5 MB
+    sandbox_allow_network: bool = True
 
     # Task-start payload limits (tunable via env vars)
     task_start_max_body_bytes: int = 64_000       # 64 KB total JSON body
