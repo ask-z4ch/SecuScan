@@ -507,6 +507,8 @@ class TaskExecutor:
         task_id: str,
         timeout: int = 600,
     ) -> tuple:
+        if timeout is None:
+            timeout = settings.sandbox_timeout
         config = SandboxConfig(
             timeout_seconds=timeout,
             max_memory_mb=settings.sandbox_memory_mb,
