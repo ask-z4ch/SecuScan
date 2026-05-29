@@ -510,14 +510,26 @@ class TaskExecutor:
         if timeout is None:
             timeout = settings.sandbox_timeout
         config = SandboxConfig(
-            timeout_seconds=timeout,
+            timeout_seconds=0,
             max_memory_mb=settings.sandbox_memory_mb,
             max_output_bytes=settings.sandbox_max_output_bytes,
             allow_network=settings.sandbox_allow_network,
         )
+
+        async def _on_chunk(data: bytes, stream_name: str):
+            text = data.decode("utf-8", errors="replace")
+            await self._broadcast(task_id, "output", text)
+
         try:
-            stdout, stderr, exit_code, violation_reason = await sandbox_execute(command, config)
+            stdout, stderr, exit_code, violation_reason = await asyncio.wait_for(
+                sandbox_execute(command, config, broadcast_callback=_on_chunk),
+                timeout=timeout,
+            )
+            if stderr:
+                stdout = stdout + "\n" + stderr if stdout else stderr
             return stdout, exit_code, violation_reason
+        except asyncio.TimeoutError:
+            return "", -1, "timeout"
         except asyncio.CancelledError:
             raise
         except Exception as e:
