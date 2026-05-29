@@ -168,11 +168,12 @@ class PluginListResponse(BaseModel):
     total: int
 
 
-class SandboxViolation(BaseModel):
-    """Structured details about a sandbox boundary breach"""
-    reason: str = Field(description="Violation type: timeout, memory_limit, or output_limit")
-    detail: str = Field(description="Human-readable explanation of the breach")
-    threshold: str = Field(description="The limit that was exceeded, e.g. '120s' or '512 MB'")
+class SandboxViolation(Exception):
+    """Raised when sandbox constraints are violated."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class ErrorResponse(BaseModel):

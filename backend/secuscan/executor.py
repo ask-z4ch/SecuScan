@@ -18,9 +18,9 @@ from .cache import get_cache
 from .config import settings
 from .database import get_db
 from .plugins import get_plugin_manager
-from .models import TaskStatus
 from .ratelimit import concurrent_limiter
-from .sandbox_executor import sandbox_execute, resolve_sandbox_config
+from .models import TaskStatus, SandboxConfig
+from .sandbox_executor import sandbox_execute
 
 # Modular Scanners
 from .scanners.port_scanner import PortScanner
@@ -285,16 +285,12 @@ class TaskExecutor:
                     ]
                     command = docker_cmd + command
 
-                sandbox_cfg = resolve_sandbox_config(plugin.sandbox)
-
                 logger.info(f"Executing task {task_id}: {' '.join(command)}")
                 await self._broadcast(task_id, "status", TaskStatus.RUNNING.value)
 
                 start_time = time.time()
-                output, exit_code, violation = await self._execute_command(
+                output, exit_code, violation_reason = await self._execute_command(
                     command,
-                    task_id,
-                    sandbox_cfg,
                 )
                 duration = time.time() - start_time
 
@@ -303,14 +299,14 @@ class TaskExecutor:
                 with open(raw_path, 'w') as f:
                     f.write(output)
 
-                if violation:
+                if violation_reason:
                     status_map = {
                         "timeout": TaskStatus.TERMINATED_TIMEOUT.value,
                         "memory_limit": TaskStatus.TERMINATED_MEMORY.value,
                         "output_limit": TaskStatus.TERMINATED_OUTPUT.value,
                     }
-                    final_status = status_map.get(violation.reason, TaskStatus.FAILED.value)
-                    error_message = violation.detail
+                    final_status = status_map.get(violation_reason, TaskStatus.FAILED.value)
+                    error_message = f"Sandbox violation: {violation_reason}"
                 else:
                     final_status, error_message = self._classify_command_result(
                         plugin=plugin,
@@ -436,19 +432,18 @@ class TaskExecutor:
     
     async def _execute_command(
         self,
-        command: list,
-        task_id: str,
-        sandbox_config,
-        timeout: int = 600
+        cmd: list,
+        timeout: Optional[int] = None,
     ) -> tuple:
+        config = SandboxConfig(
+            timeout_seconds=timeout if timeout is not None else settings.sandbox_timeout_seconds,
+            max_memory_mb=settings.sandbox_max_memory_mb,
+            max_output_bytes=settings.sandbox_max_output_bytes,
+            allow_network=settings.sandbox_allow_network,
+        )
         try:
-            output, exit_code, violation = await sandbox_execute(
-                command,
-                task_id,
-                sandbox_config,
-                broadcast_callback=lambda chunk: self._broadcast(task_id, "output", chunk),
-            )
-            return output, exit_code, violation
+            stdout, stderr, exit_code, violation_reason = await sandbox_execute(cmd, config)
+            return stdout, exit_code, violation_reason
         except asyncio.CancelledError:
             raise
         except Exception as e:

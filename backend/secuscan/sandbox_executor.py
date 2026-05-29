@@ -2,20 +2,21 @@ import asyncio
 import logging
 import platform
 from asyncio import subprocess
-from typing import Callable, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from .models import SandboxConfig, SandboxViolation
-from .config import settings
+from .models import SandboxConfig
 
 logger = logging.getLogger(__name__)
 
-_LINUX = platform.system() == "Linux"
+IS_LINUX = platform.system() == "Linux"
 
-GRACE_AFTER_SIGTERM = 3
+CHUNK_SIZE = 64 * 1024
+SIGTERM_GRACE = 3.0
 
 
 def resolve_sandbox_config(plugin_sandbox: Optional[SandboxConfig] = None) -> SandboxConfig:
     """Merge global settings with optional per-plugin sandbox overrides."""
+    from .config import settings
     base = SandboxConfig(
         timeout_seconds=settings.sandbox_timeout_seconds,
         max_memory_mb=settings.sandbox_max_memory_mb,
@@ -28,116 +29,156 @@ def resolve_sandbox_config(plugin_sandbox: Optional[SandboxConfig] = None) -> Sa
     return base.model_copy(update=overrides)
 
 
-def _apply_rlimit(config: SandboxConfig):
-    mem_bytes = config.max_memory_mb * 1024 * 1024
-    cpu_seconds = config.timeout_seconds
-    try:
+def _build_preexec_fn(config: SandboxConfig):
+    """Build preexec_fn for Linux that applies RLIMIT_AS."""
+    mem_limit = config.max_memory_mb * 1024 * 1024
+
+    def _apply_limits():
         import resource
-        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
-    except (ImportError, ResourceWarning):
-        pass
+        resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+
+    return _apply_limits
 
 
-async def sandbox_execute(
-    command: list,
-    task_id: str,
-    config: SandboxConfig,
-    broadcast_callback: Optional[Callable] = None,
-) -> Tuple[str, int, Optional[SandboxViolation]]:
-    """
-    Execute a subprocess under sandbox resource constraints.
-
-    Returns (output, exit_code, violation). ``violation`` is ``None`` when
-    the process completed normally within all configured limits.
-    """
-    extra_kw = {}
-    if _LINUX:
-        extra_kw["preexec_fn"] = lambda: _apply_rlimit(config)
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        **extra_kw,
-    )
-
-    output_bytes = bytearray()
-    violation: Optional[SandboxViolation] = None
-
-    async def _read_stdout():
-        nonlocal violation, output_bytes
-        stdout = process.stdout
-        if stdout is None:
-            return
-        cap = config.max_output_bytes
-        while not stdout.at_eof():
-            chunk = await stdout.read(4096)
-            if not chunk:
-                break
-            remaining = cap - len(output_bytes)
-            if remaining <= 0:
-                if violation is None:
-                    violation = SandboxViolation(
-                        reason="output_limit",
-                        detail=f"Output exceeded {cap} bytes and was truncated",
-                        threshold=f"{cap} bytes",
-                    )
-                    logger.warning("Task %s output cap (%d bytes) reached", task_id, cap)
-                    process.kill()
-                    await process.wait()
-                continue
-            if len(chunk) > remaining:
-                output_bytes.extend(chunk[:remaining])
-                if violation is None:
-                    violation = SandboxViolation(
-                        reason="output_limit",
-                        detail=f"Output exceeded {cap} bytes and was truncated",
-                        threshold=f"{cap} bytes",
-                    )
-                    logger.warning("Task %s output cap (%d bytes) reached", task_id, cap)
-                    process.kill()
-                    await process.wait()
-            else:
-                output_bytes.extend(chunk)
-            if broadcast_callback:
-                decoded = chunk.decode("utf-8", errors="replace")
-                await broadcast_callback(decoded)
-
-    try:
-        await asyncio.wait_for(_read_stdout(), timeout=config.timeout_seconds)
-        await process.wait()
-    except asyncio.TimeoutError:
-        if violation is None:
-            violation = SandboxViolation(
-                reason="timeout",
-                detail=f"Execution exceeded {config.timeout_seconds}s timeout",
-                threshold=f"{config.timeout_seconds}s",
-            )
-            logger.warning("Task %s timed out after %ds", task_id, config.timeout_seconds)
-        await _escalate_terminate(process, task_id)
-    except asyncio.CancelledError:
-        logger.warning("Task %s cancelled, killing subprocess", task_id)
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
-        raise
-
-    output = output_bytes.decode("utf-8", errors="replace")
-    exit_code = process.returncode if process.returncode is not None else -1
-    return output, exit_code, violation
+def classify_memory_violation(
+    exit_code: int,
+    stderr_text: str,
+    rss_bytes: int,
+    limit_bytes: int,
+) -> bool:
+    """Post-mortem heuristic to classify whether failure was caused by memory exhaustion."""
+    if exit_code in (-11, 139):
+        return True
+    if "MemoryError" in stderr_text or "Cannot allocate memory" in stderr_text:
+        return True
+    if rss_bytes >= limit_bytes * 95 // 100 and exit_code != 0:
+        return True
+    return False
 
 
-async def _escalate_terminate(process, task_id: str):
+async def _terminate_process(process):
+    """Graceful SIGTERM -> 3s grace -> SIGKILL escalation. Always reaps."""
     try:
         process.terminate()
     except ProcessLookupError:
         return
-    await asyncio.sleep(GRACE_AFTER_SIGTERM)
-    if process.returncode is not None:
-        return
-    logger.warning("Task %s did not respond to SIGTERM within %ds, sending SIGKILL", task_id, GRACE_AFTER_SIGTERM)
     try:
-        process.kill()
-    except ProcessLookupError:
-        pass
+        await asyncio.wait_for(process.wait(), timeout=SIGTERM_GRACE)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+
+
+async def _read_stream(stream, buffer, state):
+    """Read from a stream in 64KB chunks, respecting max_output_bytes limit."""
+    while True:
+        chunk = await stream.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        if state["limit_hit"]:
+            break
+        remaining = state["max_bytes"] - state["total_bytes"]
+        if remaining <= 0:
+            state["limit_hit"] = True
+            break
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+            state["limit_hit"] = True
+        buffer.extend(chunk)
+        state["total_bytes"] += len(chunk)
+
+
+async def sandbox_execute(
+    cmd: List[str],
+    config: SandboxConfig,
+) -> Tuple[str, str, int, Optional[str]]:
+    """
+    Execute a subprocess under sandbox resource constraints.
+
+    Returns (stdout_str, stderr_str, exit_code, violation_reason).
+    violation_reason is None on success, or one of
+    "timeout", "memory_limit", "output_limit".
+    """
+    preexec_fn = _build_preexec_fn(config) if IS_LINUX else None
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=preexec_fn,
+    )
+
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+
+    state = {
+        "total_bytes": 0,
+        "max_bytes": config.max_output_bytes,
+        "limit_hit": False,
+    }
+
+    violation_reason = None
+
+    reader_task = asyncio.gather(
+        _read_stream(process.stdout, stdout_buffer, state),
+        _read_stream(process.stderr, stderr_buffer, state),
+    )
+
+    try:
+        try:
+            await asyncio.wait_for(reader_task, timeout=config.timeout_seconds)
+        except asyncio.TimeoutError:
+            if state["limit_hit"]:
+                violation_reason = "output_limit"
+            else:
+                violation_reason = "timeout"
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            await _terminate_process(process)
+        else:
+            if state["limit_hit"]:
+                violation_reason = "output_limit"
+                await _terminate_process(process)
+            else:
+                await process.wait()
+    except asyncio.CancelledError:
+        violation_reason = None
+        if not reader_task.done():
+            reader_task.cancel()
+            try:
+                await reader_task
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        raise
+    finally:
+        if process.returncode is None:
+            await _terminate_process(process)
+
+    stdout_str = stdout_buffer.decode("utf-8", errors="replace")
+    stderr_str = stderr_buffer.decode("utf-8", errors="replace")
+    exit_code = process.returncode if process.returncode is not None else -1
+
+    if violation_reason is None and exit_code != 0:
+        rss_bytes = 0
+        try:
+            import resource
+            usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+            if IS_LINUX:
+                rss_bytes = usage.ru_maxrss * 1024
+            else:
+                rss_bytes = usage.ru_maxrss
+        except (ImportError, AttributeError):
+            pass
+
+        limit_bytes = config.max_memory_mb * 1024 * 1024
+
+        if classify_memory_violation(exit_code, stderr_str, rss_bytes, limit_bytes):
+            violation_reason = "memory_limit"
+
+    return stdout_str, stderr_str, exit_code, violation_reason
